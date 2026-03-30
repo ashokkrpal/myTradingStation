@@ -1,0 +1,8 @@
+nicegui>=1.4.0
+py5paisa
+pandas
+python-dotenv
+plotly
+numpy
+scipy
+requests
