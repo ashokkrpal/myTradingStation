@@ -1,9 +1,10 @@
 import os
+import json
 import time
 import logging
 import requests
 import threading
-import json
+import asyncio
 import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, time as dt_time
@@ -19,6 +20,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # ==========================================
 # 1. GLOBAL CONFIGURATION & STATE
 # ==========================================
+SESSION_FILE = "session.json"
+
 class AlgoConfig:
     MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", -5000.0))
     MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES", 20))
@@ -39,39 +42,84 @@ class State:
 client = None
 
 # ==========================================
-# 2. OAUTH LOGIC & INITIALIZATION
+# 2. FILE-BASED SESSION MANAGEMENT
 # ==========================================
-def get_access_token(request_token):
+def load_session():
+    if os.path.exists(SESSION_FILE):
+        with open(SESSION_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_session(data):
+    with open(SESSION_FILE, 'w') as f:
+        json.dump(data, f)
+
+
+# ======== AUTH RESILIENCY HELPERS (ADDED) ========
+def is_token_expired(session):
+    login_time = session.get("LOGIN_TIME")
+    if not login_time:
+        return True
+    try:
+        from datetime import datetime
+        return datetime.now().date() != datetime.fromisoformat(login_time).date()
+    except:
+        return True
+
+def is_token_valid(session):
+    try:
+        headers = {"Authorization": f"Bearer {session['ACCESS_TOKEN']}"}
+        url = "https://Openapi.5paisa.com/VendorsAPI/Service1.svc/V3/Margin"
+        payload = {"head": {"key": session.get("API_KEY")}, "body": {}}
+        r = requests.post(url, json=payload, headers=headers)
+        return r.json().get("body", {}).get("Status") == 0
+    except:
+        return False
+# =================================================
+
+
+def get_access_token(request_token, session_data):
     """Fetches the daily Access Token using the provided Request Token."""
+    # API calls MUST go to the main Openapi server
     url = "https://Openapi.5paisa.com/VendorsAPI/Service1.svc/GetAccessToken"
+    
+    headers = {"Content-Type": "application/json"}
+    
     payload = {
-        "head": {"Key": app.storage.user.get('API_KEY')},
+        "head": {"Key": session_data.get('API_KEY')},
         "body": {
             "RequestToken": request_token,
-            "EncryKey": app.storage.user.get('ENCRYPTION_KEY'),
-            "UserId": app.storage.user.get('USER_ID')
+            "EncryKey": session_data.get('ENCRYPTION_KEY'),
+            "UserId": session_data.get('USER_ID')
         }
     }
-    return requests.post(url, json=payload).json()
+    
+    try:
+        response = requests.post(url, json=payload, headers=headers)
+        try:
+            return response.json()
+        except ValueError:
+            error_preview = response.text[:300] if response.text else "Empty response"
+            return {"body": {"Status": -1, "Message": f"Broker returned invalid data (HTTP {response.status_code}). Raw: {error_preview}"}}
+    except Exception as e:
+        return {"body": {"Status": -1, "Message": f"Network Connection Error: {str(e)}"}}
 
-def initialize_client():
-    """Initializes the 5paisa client using session storage."""
+def initialize_client(session_data):
     global client
     try:
         cred = {
-            "APP_SOURCE": app.storage.user.get('APP_SOURCE', ''),
+            "APP_SOURCE": session_data.get('APP_SOURCE', ''),
             "APP_NAME": "NiceGUI_Algo", 
-            "USER_ID": app.storage.user.get('USER_ID', ''),
-            "PASSWORD": app.storage.user.get('USER_PASSWORD', ''),
-            "USER_KEY": app.storage.user.get('API_KEY', ''),
-            "ENCRYPTION_KEY": app.storage.user.get('ENCRYPTION_KEY', '')
+            "USER_ID": session_data.get('USER_ID', ''),
+            "PASSWORD": session_data.get('USER_PASSWORD', ''),
+            "USER_KEY": session_data.get('API_KEY', ''),
+            "ENCRYPTION_KEY": session_data.get('ENCRYPTION_KEY', '')
         }
         
         client = FivePaisaClient(email="dummy@example.com", passwd=cred["PASSWORD"], dob="19900101", cred=cred)
-        client.access_token = app.storage.user.get('ACCESS_TOKEN')
-        client.client_code = app.storage.user.get('CLIENT_CODE')
+        client.access_token = session_data.get('ACCESS_TOKEN')
+        client.client_code = session_data.get('CLIENT_CODE')
         
-        # Test connection validity
         if not client.margin():
             return False
             
@@ -81,40 +129,44 @@ def initialize_client():
         logging.error(f"Client initialization failed: {e}")
         return False
 
-def is_logged_in():
-    return "ACCESS_TOKEN" in app.storage.user
-
 # ==========================================
 # 3. AUTHENTICATION WEB PAGES
 # ==========================================
 @ui.page('/login')
 def login_page():
-    if is_logged_in():
+    session = load_session()
+    
+    if session.get('ACCESS_TOKEN'):
         ui.navigate.to('/')
         return
 
     with ui.card().classes('absolute-center w-full max-w-md p-8 shadow-2xl rounded-xl border border-gray-200'):
         ui.label('🔐 5paisa Secure Login').classes('text-2xl font-bold mb-2 text-center w-full')
-        ui.label('Copy and paste the exact fields from your 5paisa API Dashboard.').classes('text-sm text-gray-500 mb-6 text-center w-full')
+        ui.label('Copy and paste your keys. They will be saved securely to the server disk.').classes('text-sm text-gray-500 mb-6 text-center w-full')
 
-        api_key = ui.input('API Key', value=app.storage.user.get('API_KEY', '')).classes('w-full mb-2')
-        encry_key = ui.input('Encryption Key', value=app.storage.user.get('ENCRYPTION_KEY', '')).classes('w-full mb-2').props('type=password')
-        user_id = ui.input('User ID', value=app.storage.user.get('USER_ID', '')).classes('w-full mb-2')
-        app_source = ui.input('App Source', value=app.storage.user.get('APP_SOURCE', '')).classes('w-full mb-2')
-        user_password = ui.input('User Password', value=app.storage.user.get('USER_PASSWORD', '')).classes('w-full mb-6').props('type=password')
+        api_key = ui.input('API Key', value=session.get('API_KEY', '')).classes('w-full mb-2')
+        encry_key = ui.input('Encryption Key', value=session.get('ENCRYPTION_KEY', '')).classes('w-full mb-2').props('type=password')
+        user_id = ui.input('User ID', value=session.get('USER_ID', '')).classes('w-full mb-2')
+        app_source = ui.input('App Source', value=session.get('APP_SOURCE', '')).classes('w-full mb-2')
+        user_password = ui.input('User Password', value=session.get('USER_PASSWORD', '')).classes('w-full mb-6').props('type=password')
 
         def initiate_oauth():
-            # Save inputs to the user's browser session
-            app.storage.user.update({
+            # Save synchronously to the hard drive BEFORE redirecting
+            session.update({
                 'API_KEY': api_key.value.strip(),
                 'ENCRYPTION_KEY': encry_key.value.strip(),
                 'USER_ID': user_id.value.strip(),
                 'APP_SOURCE': app_source.value.strip(),
                 'USER_PASSWORD': user_password.value.strip()
             })
+            save_session(session)
             
-            callback_url = "http://localhost:8080/callback" 
+            # Use dev-openapi for the web portal
+            # CRITICAL: Ensure this matches the Redirect URL exactly as configured in your 5paisa Dashboard.
+            # Replace 140.245.249.255 with 'localhost' if testing locally.
+            callback_url = "http://140.245.249.255:8080/callback" 
             auth_url = f"https://dev-openapi.5paisa.com/WebVendorLogin/VLogin/Index?VendorKey={api_key.value.strip()}&ResponseURL={callback_url}"
+            
             ui.navigate.to(auth_url)
 
         ui.button('Login via 5paisa', on_click=initiate_oauth).classes('w-full h-12 text-lg font-bold bg-blue-600 text-white rounded')
@@ -128,18 +180,26 @@ def callback_page(RequestToken: str = None):
         return
 
     try:
-        res = get_access_token(RequestToken)
-        if res.get('body', {}).get('Status') == 0:
-            app.storage.user['ACCESS_TOKEN'] = res['body']['AccessToken']
-            app.storage.user['CLIENT_CODE'] = res['body']['ClientCode']
+        session = load_session()
+        res = get_access_token(RequestToken, session)
+        
+        body = res.get('body') or {}
+        
+        if body.get('Status') == 0:
+            session['ACCESS_TOKEN'] = body.get('AccessToken')
+            session['CLIENT_CODE'] = body.get('ClientCode')
+            session['LOGIN_TIME'] = datetime.now().isoformat()
+            save_session(session)
             ui.navigate.to('/')
         else:
+            error_msg = body.get('Message', 'Unknown 5paisa API Error.')
             with ui.card().classes('absolute-center p-6 text-center'):
                 ui.label(f"Token Exchange Failed!").classes('text-red-500 font-bold text-lg')
-                ui.label(res.get('body', {}).get('Message', 'Check your Encryption Key and User ID.')).classes('text-gray-700 mt-2')
+                ui.label(error_msg).classes('text-gray-700 mt-2')
+                ui.label(f"Raw Output: {res}").classes('text-xs text-gray-400 mt-4 break-words')
                 ui.button("Try Again", on_click=lambda: ui.navigate.to('/login')).classes('mt-4')
     except Exception as e:
-        ui.label(f"API Error during authentication: {e}")
+        ui.label(f"Python Error during authentication: {e}")
 
 # ==========================================
 # 4. BUSINESS LOGIC & EXECUTION ENGINE
@@ -315,8 +375,9 @@ def build_ui():
         with ui.row().classes('gap-4 items-center'):
             ui.label().bind_text_from(State, 'realized_pnl', backward=lambda p: f"Booked: ₹{p:.2f}").classes('text-gray-300 font-bold')
             State.ui_elements['total_running_pnl'] = ui.label("Running: ₹0.00").classes('text-yellow-400 font-bold')
-            # Clears the session logic securely
-            ui.button(icon='logout', color='red', on_click=lambda: [app.storage.user.clear(), ui.navigate.to('/login')]).classes('ml-4 p-2')
+            
+            # Logout clears the file session and forces re-auth
+            ui.button(icon='logout', color='red', on_click=lambda: [os.remove(SESSION_FILE) if os.path.exists(SESSION_FILE) else None, ui.navigate.to('/login')]).classes('ml-4 p-2')
 
     if not State.positions:
         fetch_live_positions()
@@ -397,25 +458,26 @@ def update_ui_loop():
 # ==========================================
 @ui.page('/')
 def main_page():
-    if not is_logged_in():
+    session = load_session()
+    
+    if not session.get('ACCESS_TOKEN') or is_token_expired(session) or not is_token_valid(session):
         ui.navigate.to('/login')
         return
 
-    is_connected = initialize_client()
+    is_connected = initialize_client(session)
     if not is_connected:
-        app.storage.user.pop('ACCESS_TOKEN', None) # Clear invalid token
+        session.pop('ACCESS_TOKEN', None) # Clear invalid token
+        save_session(session)
         ui.navigate.to('/login')
         return
     
     build_ui()
     
-    if "ws_started" not in app.storage.user:
-        app.storage.user["ws_started"] = True
+    if not any(thread.name == "5paisa_ws_thread" for thread in threading.enumerate()):
         threading.Thread(target=ws_worker, name="5paisa_ws_thread", daemon=True).start()
     
     ui.timer(0.5, update_ui_loop)
 
 if __name__ in {"__main__", "__mp_main__"}:
     port = int(os.getenv("PORT", 8080))
-    # CRITICAL: storage_secret is mandatory when using app.storage.user
-    ui.run(host="0.0.0.0", port=port, reload=False, title="5paisa Pro Terminal", storage_secret="5paisa_algo_secret_key_123")
+    ui.run(host="0.0.0.0", port=port, reload=False, title="5paisa Pro Terminal")
