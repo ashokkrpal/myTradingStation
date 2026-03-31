@@ -114,7 +114,7 @@ def login_page():
             })
             
             callback_url = "http://localhost:8080/callback" 
-            auth_url = f"https://openapi.5paisa.com/WebVendorLogin/VLogin/Index?VendorKey={api_key.value.strip()}&ResponseURL={callback_url}"
+            auth_url = f"https://dev-openapi.5paisa.com/WebVendorLogin/VLogin/Index?VendorKey={api_key.value.strip()}&ResponseURL={callback_url}"
             ui.navigate.to(auth_url)
 
         ui.button('Login via 5paisa', on_click=initiate_oauth).classes('w-full h-12 text-lg font-bold bg-blue-600 text-white rounded')
