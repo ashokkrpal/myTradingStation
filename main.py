@@ -1,17 +1,18 @@
 import os
-import json
 import time
 import logging
-import requests
 import threading
-import asyncio
+import json
 import numpy as np
 import plotly.graph_objects as go
-from datetime import datetime, time as dt_time
-from nicegui import ui, app
+from datetime import time as dt_time
+from nicegui import ui
 from py5paisa import FivePaisaClient
 from py5paisa.order import Order
 from dotenv import load_dotenv
+
+# Import our custom modules
+import auth
 from options_math import calculate_iv, bs_price
 
 load_dotenv()
@@ -20,8 +21,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # ==========================================
 # 1. GLOBAL CONFIGURATION & STATE
 # ==========================================
-SESSION_FILE = "session.json"
-
 class AlgoConfig:
     MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", -5000.0))
     MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES", 20))
@@ -42,68 +41,8 @@ class State:
 client = None
 
 # ==========================================
-# 2. FILE-BASED SESSION MANAGEMENT
+# 2. CLIENT INITIALIZATION
 # ==========================================
-def load_session():
-    if os.path.exists(SESSION_FILE):
-        with open(SESSION_FILE, 'r') as f:
-            return json.load(f)
-    return {}
-
-def save_session(data):
-    with open(SESSION_FILE, 'w') as f:
-        json.dump(data, f)
-
-
-# ======== AUTH RESILIENCY HELPERS (ADDED) ========
-def is_token_expired(session):
-    login_time = session.get("LOGIN_TIME")
-    if not login_time:
-        return True
-    try:
-        from datetime import datetime
-        return datetime.now().date() != datetime.fromisoformat(login_time).date()
-    except:
-        return True
-
-def is_token_valid(session):
-    try:
-        headers = {"Authorization": f"Bearer {session['ACCESS_TOKEN']}"}
-        url = "https://Openapi.5paisa.com/VendorsAPI/Service1.svc/V3/Margin"
-        payload = {"head": {"key": session.get("API_KEY")}, "body": {}}
-        r = requests.post(url, json=payload, headers=headers)
-        return r.json().get("body", {}).get("Status") == 0
-    except:
-        return False
-# =================================================
-
-
-def get_access_token(request_token, session_data):
-    """Fetches the daily Access Token using the provided Request Token."""
-    # API calls MUST go to the main Openapi server
-    url = "https://Openapi.5paisa.com/VendorsAPI/Service1.svc/GetAccessToken"
-    
-    headers = {"Content-Type": "application/json"}
-    
-    payload = {
-        "head": {"Key": session_data.get('API_KEY')},
-        "body": {
-            "RequestToken": request_token,
-            "EncryKey": session_data.get('ENCRYPTION_KEY'),
-            "UserId": session_data.get('USER_ID')
-        }
-    }
-    
-    try:
-        response = requests.post(url, json=payload, headers=headers)
-        try:
-            return response.json()
-        except ValueError:
-            error_preview = response.text[:300] if response.text else "Empty response"
-            return {"body": {"Status": -1, "Message": f"Broker returned invalid data (HTTP {response.status_code}). Raw: {error_preview}"}}
-    except Exception as e:
-        return {"body": {"Status": -1, "Message": f"Network Connection Error: {str(e)}"}}
-
 def initialize_client(session_data):
     global client
     try:
@@ -123,86 +62,14 @@ def initialize_client(session_data):
         if not client.margin():
             return False
             
-        logging.info("5paisa OAuth Session Valid & Connected!")
+        logging.info("5paisa API Connection Established!")
         return True
     except Exception as e:
         logging.error(f"Client initialization failed: {e}")
         return False
 
 # ==========================================
-# 3. AUTHENTICATION WEB PAGES
-# ==========================================
-@ui.page('/login')
-def login_page():
-    session = load_session()
-    
-    if session.get('ACCESS_TOKEN'):
-        ui.navigate.to('/')
-        return
-
-    with ui.card().classes('absolute-center w-full max-w-md p-8 shadow-2xl rounded-xl border border-gray-200'):
-        ui.label('🔐 5paisa Secure Login').classes('text-2xl font-bold mb-2 text-center w-full')
-        ui.label('Copy and paste your keys. They will be saved securely to the server disk.').classes('text-sm text-gray-500 mb-6 text-center w-full')
-
-        api_key = ui.input('API Key', value=session.get('API_KEY', '')).classes('w-full mb-2')
-        encry_key = ui.input('Encryption Key', value=session.get('ENCRYPTION_KEY', '')).classes('w-full mb-2').props('type=password')
-        user_id = ui.input('User ID', value=session.get('USER_ID', '')).classes('w-full mb-2')
-        app_source = ui.input('App Source', value=session.get('APP_SOURCE', '')).classes('w-full mb-2')
-        user_password = ui.input('User Password', value=session.get('USER_PASSWORD', '')).classes('w-full mb-6').props('type=password')
-
-        def initiate_oauth():
-            # Save synchronously to the hard drive BEFORE redirecting
-            session.update({
-                'API_KEY': api_key.value.strip(),
-                'ENCRYPTION_KEY': encry_key.value.strip(),
-                'USER_ID': user_id.value.strip(),
-                'APP_SOURCE': app_source.value.strip(),
-                'USER_PASSWORD': user_password.value.strip()
-            })
-            save_session(session)
-            
-            # Use dev-openapi for the web portal
-            # CRITICAL: Ensure this matches the Redirect URL exactly as configured in your 5paisa Dashboard.
-            # Replace 140.245.249.255 with 'localhost' if testing locally.
-            callback_url = "http://140.245.249.255:8080/callback" 
-            auth_url = f"https://dev-openapi.5paisa.com/WebVendorLogin/VLogin/Index?VendorKey={api_key.value.strip()}&ResponseURL={callback_url}"
-            
-            ui.navigate.to(auth_url)
-
-        ui.button('Login via 5paisa', on_click=initiate_oauth).classes('w-full h-12 text-lg font-bold bg-blue-600 text-white rounded')
-
-@ui.page('/callback')
-def callback_page(RequestToken: str = None):
-    if not RequestToken:
-        with ui.card().classes('absolute-center p-6'):
-            ui.label("❌ Authentication Failed: No Request Token received.").classes('text-red-500 font-bold')
-            ui.button("Try Again", on_click=lambda: ui.navigate.to('/login')).classes('mt-4')
-        return
-
-    try:
-        session = load_session()
-        res = get_access_token(RequestToken, session)
-        
-        body = res.get('body') or {}
-        
-        if body.get('Status') == 0:
-            session['ACCESS_TOKEN'] = body.get('AccessToken')
-            session['CLIENT_CODE'] = body.get('ClientCode')
-            session['LOGIN_TIME'] = datetime.now().isoformat()
-            save_session(session)
-            ui.navigate.to('/')
-        else:
-            error_msg = body.get('Message', 'Unknown 5paisa API Error.')
-            with ui.card().classes('absolute-center p-6 text-center'):
-                ui.label(f"Token Exchange Failed!").classes('text-red-500 font-bold text-lg')
-                ui.label(error_msg).classes('text-gray-700 mt-2')
-                ui.label(f"Raw Output: {res}").classes('text-xs text-gray-400 mt-4 break-words')
-                ui.button("Try Again", on_click=lambda: ui.navigate.to('/login')).classes('mt-4')
-    except Exception as e:
-        ui.label(f"Python Error during authentication: {e}")
-
-# ==========================================
-# 4. BUSINESS LOGIC & EXECUTION ENGINE
+# 3. TRADING BUSINESS LOGIC & EXECUTION ENGINE
 # ==========================================
 def fetch_live_positions():
     if not client: return
@@ -249,7 +116,6 @@ def adjust_position(scrip_code, adjust_amount, is_increase):
 
     req = Order(order_type=order_type, exchange="N", exchange_segment="D", scrip_code=scrip_code, quantity=abs(adjust_amount), price=0, is_intraday=False)
     try:
-        # client.place_order(req) # UNCOMMENT FOR LIVE EXECUTION
         logging.info(f"🔄 ADJUST {order_type} {abs(adjust_amount)} for {scrip_code}")
         if is_increase:
             total_cost = (abs(pos['qty']) * pos['entry']) + (abs(adjust_amount) * pos['ltp'])
@@ -275,7 +141,6 @@ def execute_square_off(scrip_code, reason, price):
             current_slice = min(slice_size, remaining)
             req = Order(order_type=order_type, exchange="N", exchange_segment="D", scrip_code=scrip_code, quantity=current_slice, price=0, is_intraday=False)
             try:
-                # client.place_order(req) # UNCOMMENT FOR LIVE EXECUTION
                 logging.info(f"🚨 SLICE {order_type} {current_slice} for {scrip_code} | {reason}")
                 remaining -= current_slice
                 State.trades_executed += 1
@@ -329,7 +194,7 @@ def ws_worker():
     except Exception as e: logging.error(f"WS Error: {e}")
 
 # ==========================================
-# 5. CHARTING ENGINE & UI DASHBOARD
+# 4. CHARTING ENGINE & UI DASHBOARD
 # ==========================================
 def generate_payoff_chart(positions_dict, days_to_expiry=3):
     fig = go.Figure()
@@ -376,8 +241,7 @@ def build_ui():
             ui.label().bind_text_from(State, 'realized_pnl', backward=lambda p: f"Booked: ₹{p:.2f}").classes('text-gray-300 font-bold')
             State.ui_elements['total_running_pnl'] = ui.label("Running: ₹0.00").classes('text-yellow-400 font-bold')
             
-            # Logout clears the file session and forces re-auth
-            ui.button(icon='logout', color='red', on_click=lambda: [os.remove(SESSION_FILE) if os.path.exists(SESSION_FILE) else None, ui.navigate.to('/login')]).classes('ml-4 p-2')
+            ui.button(icon='logout', color='red', on_click=lambda: [os.remove(auth.SESSION_FILE) if os.path.exists(auth.SESSION_FILE) else None, ui.navigate.to('/login')]).classes('ml-4 p-2')
 
     if not State.positions:
         fetch_live_positions()
@@ -454,23 +318,36 @@ def update_ui_loop():
         State.ui_elements['total_running_pnl'].set_text(f"Running: ₹{total_running_pnl:.2f}")
 
 # ==========================================
-# 6. APPLICATION ROUTING
+# 5. MAIN ROUTING & EXECUTION
 # ==========================================
 @ui.page('/')
 def main_page():
-    session = load_session()
+    session = auth.load_session()
     
-    if not session.get('ACCESS_TOKEN') or is_token_expired(session) or not is_token_valid(session):
+    # 1. Ask the gatekeeper if the token is valid
+    if not session.get('ACCESS_TOKEN') or auth.is_token_expired(session):
         ui.navigate.to('/login')
         return
 
+    # 2. Test the connection
     is_connected = initialize_client(session)
+    
+    # 3. Handle failure
     if not is_connected:
-        session.pop('ACCESS_TOKEN', None) # Clear invalid token
-        save_session(session)
-        ui.navigate.to('/login')
+        with ui.card().classes('absolute-center w-full max-w-md p-8 shadow-2xl rounded-xl border border-red-200 text-center'):
+            ui.label("🚨 API Connection Failed!").classes('text-2xl font-bold text-red-600 mb-2')
+            ui.label("5paisa approved your OAuth token, but the background API test failed.").classes('text-gray-700')
+            ui.label("Check your APP_SOURCE, USER_ID, or USER_PASSWORD for typos or trailing spaces.").classes('text-gray-700 font-bold mt-2')
+            
+            def reset_and_retry():
+                session.clear() 
+                auth.save_session(session)
+                ui.navigate.to('/login')
+                
+            ui.button("Clear Data & Try Again", color="red", on_click=reset_and_retry).classes('mt-6 w-full font-bold')
         return
     
+    # 4. Success! Load the trading terminal
     build_ui()
     
     if not any(thread.name == "5paisa_ws_thread" for thread in threading.enumerate()):
