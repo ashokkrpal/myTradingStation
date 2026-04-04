@@ -95,7 +95,7 @@ class KotakNeoAdapter(BrokerAdapter):
         return self.client.place_order(exchange_segment="nse_fo", product="NRML", price="", order_type="MKT", quantity=str(qty), validity="DAY", trading_symbol=scrip_code, transaction_type=transaction_type)
         
     def start_websocket(self, req_list, on_message_callback):
-        # Implement Kotak WS logic here
+        # Implement Kotak WS logic here when available
         pass
 
 # Global adapter instance
@@ -268,7 +268,7 @@ def ws_worker():
 def generate_payoff_chart(positions_dict, days_to_expiry=3):
     fig = go.Figure()
     if not positions_dict:
-        fig.update_layout(title="No Active Positions", template="plotly_white", height=350)
+        fig.update_layout(title="No Active Positions", template="plotly_white", height=280)
         return fig
 
     t_years = max(days_to_expiry / 365.0, 0.0001)
@@ -291,7 +291,7 @@ def generate_payoff_chart(positions_dict, days_to_expiry=3):
     color = '#10B981' if np.max(t0_payoff) > 0 else '#EF4444'
     fig.add_trace(go.Scatter(x=spot_range, y=t0_payoff, mode='lines', name='T+0 Live', line=dict(color=color, width=3), fill='tozeroy'))
     fig.add_vline(x=State.current_spot, line_dash="dot", line_color="orange")
-    fig.update_layout(title="Options Payoff Profile", hovermode="x unified", template="plotly_white", height=350, margin=dict(l=20, r=20, t=40, b=20))
+    fig.update_layout(title="Options Payoff Profile", hovermode="x unified", template="plotly_white", height=280, margin=dict(l=20, r=20, t=40, b=20))
     return fig
 
 def build_ui():
@@ -368,37 +368,65 @@ def build_ui():
                     State.simulated_cart[code]['qty'] = qty
                     State.ui_elements['sim_chart'].update_figure(generate_payoff_chart(State.simulated_cart))
 
-            with ui.row().classes('w-full gap-4'):
-                with ui.column().classes('w-1/2'):
-                    ui.label("Live Option Chain (NIFTY)").classes('font-bold text-lg bg-gray-200 p-2 w-full rounded')
-                    with ui.row().classes('w-full font-bold text-xs bg-slate-100 p-2 text-center'):
-                        ui.label("CE Buy").classes('w-1/6'); ui.label("CE Sell").classes('w-1/6')
-                        ui.label("STRIKE").classes('w-2/6 text-blue-600')
-                        ui.label("PE Sell").classes('w-1/6'); ui.label("PE Buy").classes('w-1/6')
-
-                    for strike in [21800, 21900, 22000, 22100, 22200]:
-                        with ui.row().classes('w-full border-b p-2 items-center text-center'):
-                            ui.button("B", color='green', on_click=lambda s=strike: add_to_sim(s, 'CE', 120, True)).classes('w-1/6 h-8 min-w-0')
-                            ui.button("S", color='red', on_click=lambda s=strike: add_to_sim(s, 'CE', 118, False)).classes('w-1/6 h-8 min-w-0')
-                            ui.label(str(strike)).classes('w-2/6 font-bold text-lg')
-                            ui.button("S", color='red', on_click=lambda s=strike: add_to_sim(s, 'PE', 95, False)).classes('w-1/6 h-8 min-w-0')
-                            ui.button("B", color='green', on_click=lambda s=strike: add_to_sim(s, 'PE', 98, True)).classes('w-1/6 h-8 min-w-0')
+            with ui.row().classes('w-full gap-4 flex-nowrap'):
                 
-                with ui.column().classes('w-5/12 bg-white shadow-lg p-4 rounded border'):
+                # LEFT COLUMN: The Option Chain (Given 60% of the screen)
+                with ui.column().classes('w-[60%] min-w-[600px]'):
+                    ui.label("Live Option Chain (NIFTY)").classes('font-bold text-lg bg-gray-200 p-2 w-full rounded')
+                    
+                    with ui.row().classes('w-full font-bold text-[11px] bg-slate-100 p-2 text-center flex-nowrap items-center'):
+                        ui.label("CE Buy").classes('flex-1')
+                        ui.label("CE Sell").classes('flex-1')
+                        ui.label("LTP").classes('flex-1')
+                        ui.label("OI Chg").classes('flex-1')
+                        ui.label("STRIKE").classes('flex-1 text-blue-600 text-sm')
+                        ui.label("OI Chg").classes('flex-1')
+                        ui.label("LTP").classes('flex-1')
+                        ui.label("PE Sell").classes('flex-1')
+                        ui.label("PE Buy").classes('flex-1')
+
+                    mock_chain_data = {
+                        21800: {'ce_ltp': 245.5, 'ce_oi': '+12.5k', 'pe_ltp': 12.2,  'pe_oi': '-2.1k'},
+                        21900: {'ce_ltp': 175.0, 'ce_oi': '+18.2k', 'pe_ltp': 34.5,  'pe_oi': '+1.5k'},
+                        22000: {'ce_ltp': 115.0, 'ce_oi': '+25.0k', 'pe_ltp': 95.0,  'pe_oi': '+5.8k'},
+                        22100: {'ce_ltp': 68.5,  'ce_oi': '+10.1k', 'pe_ltp': 148.0, 'pe_oi': '+18.9k'},
+                        22200: {'ce_ltp': 35.0,  'ce_oi': '+4.5k',  'pe_ltp': 215.5, 'pe_oi': '+22.4k'},
+                    }
+
+                    for strike, data in mock_chain_data.items():
+                        with ui.row().classes('w-full border-b p-1 items-center text-center flex-nowrap'):
+                            ui.button("B", color='green', on_click=lambda s=strike, p=data['ce_ltp']: add_to_sim(s, 'CE', p, True)).classes('flex-1 h-8 min-w-0 p-0 text-xs')
+                            ui.button("S", color='red', on_click=lambda s=strike, p=data['ce_ltp']: add_to_sim(s, 'CE', p, False)).classes('flex-1 h-8 min-w-0 p-0 text-xs')
+                            ui.label(str(data['ce_ltp'])).classes('flex-1 text-xs font-semibold')
+                            ui.label(data['ce_oi']).classes('flex-1 text-xs ' + ('text-green-600' if '+' in data['ce_oi'] else 'text-red-600'))
+                            
+                            ui.label(str(strike)).classes('flex-1 font-bold text-sm bg-gray-50 py-1 rounded')
+                            
+                            ui.label(data['pe_oi']).classes('flex-1 text-xs ' + ('text-green-600' if '+' in data['pe_oi'] else 'text-red-600'))
+                            ui.label(str(data['pe_ltp'])).classes('flex-1 text-xs font-semibold')
+                            ui.button("S", color='red', on_click=lambda s=strike, p=data['pe_ltp']: add_to_sim(s, 'PE', p, False)).classes('flex-1 h-8 min-w-0 p-0 text-xs')
+                            ui.button("B", color='green', on_click=lambda s=strike, p=data['pe_ltp']: add_to_sim(s, 'PE', p, True)).classes('flex-1 h-8 min-w-0 p-0 text-xs')
+                
+                # RIGHT COLUMN: Cart & Execution (Given 38% of the screen)
+                with ui.column().classes('w-[38%] min-w-[350px] bg-white shadow-lg p-4 rounded border'):
                     ui.label("Strategy Cart & Payoff").classes('font-bold text-lg mb-2')
-                    State.ui_elements['sim_chart'] = ui.plotly(generate_payoff_chart({})).classes('w-full h-64')
+                    
+                    State.ui_elements['sim_chart'] = ui.plotly(generate_payoff_chart({})).classes('w-full h-[280px]')
+                    
                     ui.label("Adjust Legs").classes('font-bold text-sm mt-4 text-gray-500')
-                    State.ui_elements['sim_cart_container'] = ui.column().classes('w-full gap-2')
+                    
+                    with ui.scroll_area().classes('w-full max-h-[200px] border rounded p-2'):
+                        State.ui_elements['sim_cart_container'] = ui.column().classes('w-full gap-2')
                     
                     def render_cart():
                         State.ui_elements['sim_cart_container'].clear()
                         with State.ui_elements['sim_cart_container']:
                             for code, leg in list(State.simulated_cart.items()):
-                                with ui.row().classes('w-full items-center justify-between text-sm bg-gray-50 p-2 rounded'):
+                                with ui.row().classes('w-full items-center justify-between text-sm bg-gray-50 p-2 rounded border flex-nowrap'):
                                     action_color = 'text-green-600' if leg['qty'] > 0 else 'text-red-600'
-                                    ui.label(f"{'BUY' if leg['qty']>0 else 'SELL'} {leg['strike']} {leg['opt_type']}").classes(f'font-bold {action_color}')
+                                    ui.label(f"{'BUY' if leg['qty']>0 else 'SELL'} {leg['strike']} {leg['opt_type']}").classes(f'font-bold {action_color} truncate w-1/3')
                                     ui.number(value=leg['qty'], format='%d', on_change=lambda e, c=code: update_cart_qty(c, int(e.value))).classes('w-20').props('dense')
-                                    ui.button(icon="delete", color="gray", on_click=lambda c=code: remove_from_cart(c)).props('flat dense')
+                                    ui.button(icon="delete", color="gray", on_click=lambda c=code: remove_from_cart(c)).props('flat dense size=sm').classes('w-8')
                     
                     def execute_strategy():
                         if not State.simulated_cart:
@@ -408,7 +436,6 @@ def build_ui():
                             ui.notify("Mock Order Placed Successfully!", type="positive")
                         else:
                             ui.notify(f"Executing Strategy to {State.active_broker_name}...", type="info")
-                            # Loop through cart and fire to the active broker adapter!
                             for code, leg in State.simulated_cart.items():
                                 broker.place_order(leg['symbol'], abs(leg['qty']), leg['qty'] > 0)
                         
@@ -416,9 +443,9 @@ def build_ui():
                         State.ui_elements['sim_chart'].update_figure(generate_payoff_chart({}))
                         render_cart()
 
-                    with ui.row().classes('w-full mt-4 gap-2'):
-                        ui.button("Clear", color='gray', on_click=lambda: [State.simulated_cart.clear(), render_cart(), State.ui_elements['sim_chart'].update_figure(generate_payoff_chart({}))]).classes('w-1/3 font-bold')
-                        ui.button("EXECUTE LIVE", color='blue-800', on_click=execute_strategy).classes('w-7/12 font-bold shadow-lg')
+                    with ui.row().classes('w-full mt-4 gap-2 flex-nowrap'):
+                        ui.button("Clear", color='gray', on_click=lambda: [State.simulated_cart.clear(), render_cart(), State.ui_elements['sim_chart'].update_figure(generate_payoff_chart({}))]).classes('flex-1 font-bold')
+                        ui.button("EXECUTE LIVE", color='blue-800', on_click=execute_strategy).classes('flex-[2] font-bold shadow-lg')
 
 def update_ui_loop():
     total_running_pnl = 0.0; current_qty_sum = 0
