@@ -11,7 +11,6 @@ from py5paisa import FivePaisaClient
 from py5paisa.order import Order
 from dotenv import load_dotenv
 
-# Import our custom modules
 import auth
 from options_math import calculate_iv, bs_price
 
@@ -30,6 +29,7 @@ class AlgoConfig:
     RISK_FREE_RATE = 0.07
 
 class State:
+    is_mock_mode = False
     trades_executed = 0
     realized_pnl = 0.0
     positions = {}        
@@ -41,7 +41,33 @@ class State:
 client = None
 
 # ==========================================
-# 2. CLIENT INITIALIZATION
+# 2. MOCK DATA ENGINE (IRON CONDOR)
+# ==========================================
+def setup_mock_iron_condor():
+    """Generates a perfect 4-leg Nifty Iron Condor for offline testing."""
+    State.current_spot = 22000.0
+    State.positions = {
+        1: {'symbol': 'NIFTY 21500 PE', 'strike': 21500.0, 'opt_type': 'PE', 'qty': -50, 'entry': 85.5, 'ltp': 85.5, 'sl': 0.0, 'tp': 0.0, 'is_long': False, 'adjust_lot': 50, 'slice_size': 50},
+        2: {'symbol': 'NIFTY 21300 PE', 'strike': 21300.0, 'opt_type': 'PE', 'qty': 50,  'entry': 45.0, 'ltp': 45.0, 'sl': 0.0, 'tp': 0.0, 'is_long': True,  'adjust_lot': 50, 'slice_size': 50},
+        3: {'symbol': 'NIFTY 22500 CE', 'strike': 22500.0, 'opt_type': 'CE', 'qty': -50, 'entry': 90.0, 'ltp': 90.0, 'sl': 0.0, 'tp': 0.0, 'is_long': False, 'adjust_lot': 50, 'slice_size': 50},
+        4: {'symbol': 'NIFTY 22700 CE', 'strike': 22700.0, 'opt_type': 'CE', 'qty': 50,  'entry': 50.0, 'ltp': 50.0, 'sl': 0.0, 'tp': 0.0, 'is_long': True,  'adjust_lot': 50, 'slice_size': 50},
+    }
+
+def mock_ws_worker():
+    """Simulates live market data by subtly fluctuating prices over time."""
+    while State.is_mock_mode:
+        if not AlgoConfig.HALT_TRADING:
+            # Random walk the spot price slightly
+            State.current_spot += np.random.normal(0, 1.5)
+            for scrip, pos in list(State.positions.items()):
+                if pos.get('is_closing'): continue
+                # Random walk the option premiums
+                new_ltp = max(0.05, pos['ltp'] + np.random.normal(0, 0.8))
+                process_tick(scrip, new_ltp)
+        time.sleep(1)
+
+# ==========================================
+# 3. CLIENT INITIALIZATION
 # ==========================================
 def initialize_client(session_data):
     global client
@@ -69,10 +95,10 @@ def initialize_client(session_data):
         return False
 
 # ==========================================
-# 3. TRADING BUSINESS LOGIC & EXECUTION ENGINE
+# 4. TRADING BUSINESS LOGIC & EXECUTION ENGINE
 # ==========================================
 def fetch_live_positions():
-    if not client: return
+    if not client or State.is_mock_mode: return
     try:
         raw_positions = client.positions()
         if not raw_positions: return
@@ -116,7 +142,8 @@ def adjust_position(scrip_code, adjust_amount, is_increase):
 
     req = Order(order_type=order_type, exchange="N", exchange_segment="D", scrip_code=scrip_code, quantity=abs(adjust_amount), price=0, is_intraday=False)
     try:
-        logging.info(f"🔄 ADJUST {order_type} {abs(adjust_amount)} for {scrip_code}")
+        # if not State.is_mock_mode: client.place_order(req)
+        logging.info(f"🔄 {'[MOCK] ' if State.is_mock_mode else ''}ADJUST {order_type} {abs(adjust_amount)} for {scrip_code}")
         if is_increase:
             total_cost = (abs(pos['qty']) * pos['entry']) + (abs(adjust_amount) * pos['ltp'])
             pos['entry'] = round(total_cost / (abs(pos['qty']) + abs(adjust_amount)), 2)
@@ -141,7 +168,8 @@ def execute_square_off(scrip_code, reason, price):
             current_slice = min(slice_size, remaining)
             req = Order(order_type=order_type, exchange="N", exchange_segment="D", scrip_code=scrip_code, quantity=current_slice, price=0, is_intraday=False)
             try:
-                logging.info(f"🚨 SLICE {order_type} {current_slice} for {scrip_code} | {reason}")
+                # if not State.is_mock_mode: client.place_order(req)
+                logging.info(f"🚨 {'[MOCK] ' if State.is_mock_mode else ''}SLICE {order_type} {current_slice} for {scrip_code} | {reason}")
                 remaining -= current_slice
                 State.trades_executed += 1
                 slice_pnl = (price - pos['entry']) * current_slice if pos['is_long'] else (pos['entry'] - price) * current_slice
@@ -166,7 +194,7 @@ def process_tick(scrip_code, ltp):
     
     pos = State.positions.get(scrip_code)
     if not pos or pos.get('is_closing', False): return 
-    pos['ltp'] = ltp
+    pos['ltp'] = round(ltp, 2)
     
     sl_hit = (pos['is_long'] and pos['sl'] > 0 and ltp <= pos['sl']) or (not pos['is_long'] and pos['sl'] > 0 and ltp >= pos['sl'])
     tp_hit = (pos['is_long'] and pos['tp'] > 0 and ltp >= pos['tp']) or (not pos['is_long'] and pos['tp'] > 0 and ltp <= pos['tp'])
@@ -194,7 +222,7 @@ def ws_worker():
     except Exception as e: logging.error(f"WS Error: {e}")
 
 # ==========================================
-# 4. CHARTING ENGINE & UI DASHBOARD
+# 5. CHARTING ENGINE & UI DASHBOARD
 # ==========================================
 def generate_payoff_chart(positions_dict, days_to_expiry=3):
     fig = go.Figure()
@@ -236,14 +264,22 @@ def add_to_sim(strike, opt_type, price, is_buy):
 
 def build_ui():
     with ui.header().classes('bg-slate-900 items-center p-4 justify-between'):
-        ui.label('📈 Pro Algo Terminal').classes('text-2xl font-bold text-white')
+        title = '📈 Pro Algo Terminal [MOCK MODE]' if State.is_mock_mode else '📈 Pro Algo Terminal'
+        ui.label(title).classes('text-2xl font-bold text-orange-400' if State.is_mock_mode else 'text-2xl font-bold text-white')
+        
         with ui.row().classes('gap-4 items-center'):
             ui.label().bind_text_from(State, 'realized_pnl', backward=lambda p: f"Booked: ₹{p:.2f}").classes('text-gray-300 font-bold')
             State.ui_elements['total_running_pnl'] = ui.label("Running: ₹0.00").classes('text-yellow-400 font-bold')
             
-            ui.button(icon='logout', color='red', on_click=lambda: [os.remove(auth.SESSION_FILE) if os.path.exists(auth.SESSION_FILE) else None, ui.navigate.to('/login')]).classes('ml-4 p-2')
+            def hard_logout():
+                if os.path.exists(auth.SESSION_FILE): os.remove(auth.SESSION_FILE)
+                State.is_mock_mode = False
+                State.positions.clear()
+                ui.navigate.to('/login')
+                
+            ui.button(icon='logout', color='red', on_click=hard_logout).classes('ml-4 p-2')
 
-    if not State.positions:
+    if not State.positions and not State.is_mock_mode:
         fetch_live_positions()
 
     with ui.tabs().classes('w-full mt-4') as tabs:
@@ -318,40 +354,57 @@ def update_ui_loop():
         State.ui_elements['total_running_pnl'].set_text(f"Running: ₹{total_running_pnl:.2f}")
 
 # ==========================================
-# 5. MAIN ROUTING & EXECUTION
+# 6. MAIN ROUTING & EXECUTION
 # ==========================================
 @ui.page('/')
 def main_page():
     session = auth.load_session()
+    is_mock = session.get('MOCK_MODE', False)
     
-    # 1. Ask the gatekeeper if the token is valid
-    if not session.get('ACCESS_TOKEN') or auth.is_token_expired(session):
-        ui.navigate.to('/login')
-        return
+    if not is_mock:
+        if not session.get('ACCESS_TOKEN') or auth.is_token_expired(session):
+            ui.navigate.to('/login')
+            return
 
-    # 2. Test the connection
-    is_connected = initialize_client(session)
-    
-    # 3. Handle failure
-    if not is_connected:
-        with ui.card().classes('absolute-center w-full max-w-md p-8 shadow-2xl rounded-xl border border-red-200 text-center'):
-            ui.label("🚨 API Connection Failed!").classes('text-2xl font-bold text-red-600 mb-2')
-            ui.label("5paisa approved your OAuth token, but the background API test failed.").classes('text-gray-700')
-            ui.label("Check your APP_SOURCE, USER_ID, or USER_PASSWORD for typos or trailing spaces.").classes('text-gray-700 font-bold mt-2')
-            
-            def reset_and_retry():
-                session.clear() 
-                auth.save_session(session)
-                ui.navigate.to('/login')
+        is_connected = initialize_client(session)
+        
+        if not is_connected:
+            with ui.card().classes('absolute-center w-full max-w-md p-8 shadow-2xl rounded-xl border border-red-200 text-center'):
+                ui.label("🚨 API Connection Failed!").classes('text-2xl font-bold text-red-600 mb-2')
+                ui.label("5paisa approved your OAuth token, but the background API test failed.").classes('text-gray-700')
+                ui.label("Check your APP_SOURCE, USER_ID, or USER_PASSWORD for typos or trailing spaces.").classes('text-gray-700 font-bold mt-2')
                 
-            ui.button("Clear Data & Try Again", color="red", on_click=reset_and_retry).classes('mt-6 w-full font-bold')
-        return
+                def reset_and_retry():
+                    session.clear() 
+                    auth.save_session(session)
+                    ui.navigate.to('/login')
+                    
+                # ==== MOCK MODE BUTTON ADDED HERE TOO ====
+                def activate_mock():
+                    session['MOCK_MODE'] = True
+                    auth.save_session(session)
+                    ui.navigate.to('/')
+                    
+                ui.button("Proceed with Sample Data", color="orange", on_click=activate_mock).classes('mt-6 w-full font-bold')
+                ui.button("Clear Data & Try Again", color="red", on_click=reset_and_retry).classes('mt-2 w-full font-bold')
+            return
+            
+    else:
+        # User requested the offline simulation!
+        State.is_mock_mode = True
+        if not State.positions:
+            setup_mock_iron_condor()
     
-    # 4. Success! Load the trading terminal
+    # Load the terminal
     build_ui()
     
-    if not any(thread.name == "5paisa_ws_thread" for thread in threading.enumerate()):
-        threading.Thread(target=ws_worker, name="5paisa_ws_thread", daemon=True).start()
+    # Start the correct background data feed
+    if is_mock:
+        if not any(thread.name == "mock_ws_thread" for thread in threading.enumerate()):
+            threading.Thread(target=mock_ws_worker, name="mock_ws_thread", daemon=True).start()
+    else:
+        if not any(thread.name == "5paisa_ws_thread" for thread in threading.enumerate()):
+            threading.Thread(target=ws_worker, name="5paisa_ws_thread", daemon=True).start()
     
     ui.timer(0.5, update_ui_loop)
 
