@@ -60,8 +60,7 @@ def get_access_token(request_token, session_data):
 def login_page():
     session = load_session()
     
-    # Check if token is already valid
-    if session.get('ACCESS_TOKEN') and not is_token_expired(session):
+    if session.get('MOCK_MODE') or (session.get('ACCESS_TOKEN') and not is_token_expired(session)):
         ui.navigate.to('/')
         return
 
@@ -122,6 +121,14 @@ def callback_page(RequestToken: str = None):
                 ui.label(f"Token Exchange Failed!").classes('text-red-500 font-bold text-lg')
                 ui.label(error_msg).classes('text-gray-700 mt-2')
                 ui.label(f"Raw Output: {res}").classes('text-xs text-gray-400 mt-4 break-words')
-                ui.button("Try Again", on_click=lambda: ui.navigate.to('/login')).classes('mt-4')
+                
+                # ==== MOCK MODE BUTTON ADDED HERE ====
+                def activate_mock():
+                    session['MOCK_MODE'] = True
+                    save_session(session)
+                    ui.navigate.to('/')
+                
+                ui.button("Proceed with Sample Data", color="orange", on_click=activate_mock).classes('mt-6 w-full font-bold')
+                ui.button("Try Again", color="gray", on_click=lambda: ui.navigate.to('/login')).classes('mt-2 w-full')
     except Exception as e:
         ui.label(f"Python Error during authentication: {e}")
