@@ -3,16 +3,18 @@ import time
 import logging
 import threading
 import json
+import requests
+import urllib.parse
 import numpy as np
 import plotly.graph_objects as go
-from datetime import time as dt_time
+from datetime import datetime, timedelta, time as dt_time
 from nicegui import ui
 from dotenv import load_dotenv
 
 import auth
 from options_math import calculate_iv, bs_price
 
-# Broker SDKs
+# Brokers
 from py5paisa import FivePaisaClient
 from py5paisa.order import Order as FivePaisaOrder
 try:
@@ -24,13 +26,19 @@ except ImportError:
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Helper to dynamically get the next weekly expiry for Option Chain
+def get_next_thursday():
+    today = datetime.today()
+    days_ahead = 3 - today.weekday()
+    if days_ahead < 0: days_ahead += 7
+    return (today + timedelta(days_ahead)).strftime('%Y-%m-%d')
+
 # ==========================================
 # 1. GLOBAL CONFIGURATION & STATE
 # ==========================================
 class AlgoConfig:
     MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", -5000.0))
     MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES", 20))
-    TIME_EXIT = dt_time(15, 15)
     HALT_TRADING = False
     SLICE_DELAY_SEC = 1.5
     RISK_FREE_RATE = 0.07
@@ -52,75 +60,83 @@ class State:
 class BrokerAdapter:
     def get_positions(self): return []
     def place_order(self, scrip_code, qty, is_buy): pass
-    def start_websocket(self, req_list, on_message_callback): pass
+    def get_option_chain(self): return []
+
+class UpstoxAdapter(BrokerAdapter):
+    def __init__(self, session):
+        self.access_token = session.get('ACCESS_TOKEN')
+        self.headers = {'accept': 'application/json', 'Api-Version': '2.0', 'Authorization': f'Bearer {self.access_token}'}
+        res = requests.get("https://api.upstox.com/v2/user/profile", headers=self.headers)
+        if res.status_code != 200: raise Exception(f"Upstox Profile Auth failed: {res.text}")
+
+    def get_positions(self):
+        res = requests.get("https://api.upstox.com/v2/portfolio/short-term-positions", headers=self.headers)
+        if res.status_code == 200:
+            return [{'NetQty': p.get('net_quantity', 0), 'ScripCode': p.get('instrument_token', ''),
+                     'ScripName': p.get('trading_symbol', ''), 'AveragePrice': p.get('average_price', 0.0)}
+                    for p in res.json().get('data', [])]
+        return []
+
+    def place_order(self, scrip_code, qty, is_buy):
+        data = {
+            "quantity": abs(qty), "product": "D", "validity": "DAY", "price": 0.0,
+            "instrument_token": str(scrip_code), "order_type": "MARKET",
+            "transaction_type": "BUY" if is_buy else "SELL",
+            "disclosed_quantity": 0, "trigger_price": 0.0, "is_amo": False
+        }
+        res = requests.post("https://api.upstox.com/v2/order/regular", headers=self.headers, json=data)
+        return res.json()
+
+    def get_option_chain(self):
+        # Fetch real-time NIFTY chain for the closest expiry
+        url = f"https://api.upstox.com/v2/option/chain?instrument_key={urllib.parse.quote('NSE_INDEX|Nifty 50')}&expiry_date={get_next_thursday()}"
+        try:
+            res = requests.get(url, headers=self.headers)
+            if res.status_code == 200: return res.json().get('data', [])
+        except: pass
+        return []
 
 class FivePaisaAdapter(BrokerAdapter):
     def __init__(self, session):
-        cred = {
-            "APP_SOURCE": session.get('APP_SOURCE', ''), "APP_NAME": "NiceGUI_Algo", 
-            "USER_ID": session.get('USER_ID', ''), "PASSWORD": session.get('USER_PASSWORD', ''),
-            "USER_KEY": session.get('API_KEY', ''), "ENCRYPTION_KEY": session.get('ENCRYPTION_KEY', '')
-        }
+        cred = {"APP_SOURCE": session.get('APP_SOURCE', ''), "APP_NAME": "NiceGUI_Algo", "USER_ID": session.get('USER_ID', ''), 
+                "PASSWORD": session.get('USER_PASSWORD', ''), "USER_KEY": session.get('API_KEY', ''), "ENCRYPTION_KEY": session.get('ENCRYPTION_KEY', '')}
         self.client = FivePaisaClient(email="dummy@example.com", passwd=cred["PASSWORD"], dob="19900101", cred=cred)
         self.client.access_token = session.get('ACCESS_TOKEN')
         self.client.client_code = session.get('CLIENT_CODE')
-        if not self.client.margin(): raise Exception("5paisa Margin/Auth check failed")
+        if not self.client.margin(): raise Exception("5paisa Auth failed")
 
-    def get_positions(self):
-        raw = self.client.positions()
-        return raw if raw else []
-
+    def get_positions(self): return self.client.positions() or []
     def place_order(self, scrip_code, qty, is_buy):
-        order_type = "B" if is_buy else "S"
-        req = FivePaisaOrder(order_type=order_type, exchange="N", exchange_segment="D", scrip_code=scrip_code, quantity=qty, price=0, is_intraday=False)
+        req = FivePaisaOrder(order_type="B" if is_buy else "S", exchange="N", exchange_segment="D", scrip_code=scrip_code, quantity=qty, price=0, is_intraday=False)
         return self.client.place_order(req)
-
-    def start_websocket(self, req_list, on_message_callback):
-        ws = self.client.ws_client(on_message=on_message_callback)
-        ws.connect()
-        self.client.Request_Feed('mf', 's', req_list)
 
 class KotakNeoAdapter(BrokerAdapter):
     def __init__(self, session):
-        if not KOTAK_SDK_AVAILABLE: raise Exception("Kotak Neo SDK not installed. Run 'pip install neo-api-client'")
+        if not KOTAK_SDK_AVAILABLE: raise Exception("Kotak SDK not installed.")
         self.client = NeoAPI(consumer_key=session.get('KOTAK_CONSUMER_KEY'), consumer_secret=session.get('KOTAK_CONSUMER_SECRET'), environment='prod')
         self.client.login(mobilenumber=session.get('KOTAK_MOBILE'), password=session.get('KOTAK_PASSWORD'))
         self.client.session_2fa(OTP=session.get('KOTAK_MPIN'))
-
-    def get_positions(self):
-        return self.client.positions()
-
+    def get_positions(self): return self.client.positions()
     def place_order(self, scrip_code, qty, is_buy):
-        transaction_type = "B" if is_buy else "S"
-        return self.client.place_order(exchange_segment="nse_fo", product="NRML", price="", order_type="MKT", quantity=str(qty), validity="DAY", trading_symbol=scrip_code, transaction_type=transaction_type)
-        
-    def start_websocket(self, req_list, on_message_callback):
-        # Implement Kotak WS logic here when available
-        pass
+        return self.client.place_order(exchange_segment="nse_fo", product="NRML", price="", order_type="MKT", quantity=str(qty), validity="DAY", trading_symbol=scrip_code, transaction_type="B" if is_buy else "S")
 
-# Global adapter instance
 broker = None
-
 def initialize_client(session_data):
     global broker
     try:
-        broker_choice = session_data.get('ACTIVE_BROKER')
-        if broker_choice == '5paisa':
-            broker = FivePaisaAdapter(session_data)
-        elif broker_choice == 'KOTAK':
-            broker = KotakNeoAdapter(session_data)
-        else:
-            return False
-        
-        State.active_broker_name = broker_choice
-        logging.info(f"{broker_choice} API Connection Established!")
+        b_choice = session_data.get('ACTIVE_BROKER')
+        if b_choice == 'UPSTOX': broker = UpstoxAdapter(session_data)
+        elif b_choice == '5paisa': broker = FivePaisaAdapter(session_data)
+        elif b_choice == 'KOTAK': broker = KotakNeoAdapter(session_data)
+        else: return False
+        State.active_broker_name = b_choice
         return True
     except Exception as e:
-        logging.error(f"Broker initialization failed: {e}")
+        logging.error(f"Broker init failed: {e}")
         return False
 
 # ==========================================
-# 3. MOCK DATA ENGINE (IRON CONDOR)
+# 3. MOCK DATA & EXECUTION ENGINE
 # ==========================================
 def setup_mock_iron_condor():
     State.current_spot = 22000.0
@@ -138,13 +154,9 @@ def mock_ws_worker():
             State.current_spot += np.random.normal(0, 1.5)
             for scrip, pos in list(State.positions.items()):
                 if pos.get('is_closing'): continue
-                new_ltp = max(0.05, pos['ltp'] + np.random.normal(0, 0.8))
-                process_tick(scrip, new_ltp)
+                pos['ltp'] = round(max(0.05, pos['ltp'] + np.random.normal(0, 0.8)), 2)
         time.sleep(1)
 
-# ==========================================
-# 4. TRADING EXECUTION ENGINE
-# ==========================================
 def fetch_live_positions():
     if not broker or State.is_mock_mode: return
     try:
@@ -152,8 +164,7 @@ def fetch_live_positions():
         for pos in raw_positions:
             qty = int(pos.get('NetQty', 0))
             if qty == 0: continue
-            
-            scrip_code = int(pos.get('ScripCode', 0))
+            scrip_code = str(pos.get('ScripCode', 0)) # Standardized as string for broker keys
             symbol = pos.get('ScripName', pos.get('tradingSymbol', f"Scrip_{scrip_code}"))
             entry_price = float(pos.get('AveragePrice', pos.get('buyAmt', 0.0)))
             
@@ -165,105 +176,14 @@ def fetch_live_positions():
             except: pass
 
             State.positions[scrip_code] = {
-                'symbol': symbol, 'strike': strike, 'opt_type': opt_type,
-                'qty': qty, 'entry': entry_price, 'ltp': entry_price,
-                'sl': 0.0, 'tp': 0.0, 'is_long': qty > 0,
-                'adjust_lot': 25, 'slice_size': abs(qty)
+                'symbol': symbol, 'strike': strike, 'opt_type': opt_type, 'qty': qty, 'entry': entry_price, 
+                'ltp': entry_price, 'sl': 0.0, 'tp': 0.0, 'is_long': qty > 0, 'adjust_lot': 25, 'slice_size': abs(qty)
             }
     except Exception as e:
         logging.error(f"Live fetch failed: {e}")
 
-def adjust_position(scrip_code, adjust_amount, is_increase):
-    pos = State.positions.get(scrip_code)
-    if not pos or AlgoConfig.HALT_TRADING or adjust_amount <= 0: return
-
-    is_buy = not pos['is_long'] if not is_increase else pos['is_long']
-    qty_change = adjust_amount if pos['is_long'] else -adjust_amount
-    if not is_increase: qty_change = -qty_change
-
-    if not is_increase and abs(qty_change) >= abs(pos['qty']): return 
-
-    try:
-        if not State.is_mock_mode: broker.place_order(scrip_code, abs(adjust_amount), is_buy)
-        logging.info(f"🔄 {'[MOCK] ' if State.is_mock_mode else ''}ADJUST {'BUY' if is_buy else 'SELL'} {abs(adjust_amount)} for {scrip_code}")
-        
-        if is_increase:
-            total_cost = (abs(pos['qty']) * pos['entry']) + (abs(adjust_amount) * pos['ltp'])
-            pos['entry'] = round(total_cost / (abs(pos['qty']) + abs(adjust_amount)), 2)
-        pos['qty'] += qty_change
-        State.trades_executed += 1
-    except Exception as e:
-        logging.error(f"Adjustment failed: {e}")
-
-def execute_square_off(scrip_code, reason, price):
-    pos = State.positions.get(scrip_code)
-    if not pos or AlgoConfig.HALT_TRADING or pos.get('is_closing', False): return
-    pos['is_closing'] = True
-    
-    slice_size = pos.get('slice_size', abs(pos['qty']))
-    total_qty = abs(pos['qty'])
-    is_buy = not pos['is_long']
-    if slice_size >= total_qty or slice_size <= 0: slice_size = total_qty
-
-    def slicer_thread():
-        remaining = total_qty
-        while remaining > 0 and scrip_code in State.positions:
-            current_slice = min(slice_size, remaining)
-            try:
-                if not State.is_mock_mode: broker.place_order(scrip_code, current_slice, is_buy)
-                logging.info(f"🚨 {'[MOCK] ' if State.is_mock_mode else ''}SLICE {'BUY' if is_buy else 'SELL'} {current_slice} for {scrip_code} | {reason}")
-                
-                remaining -= current_slice
-                State.trades_executed += 1
-                slice_pnl = (price - pos['entry']) * current_slice if pos['is_long'] else (pos['entry'] - price) * current_slice
-                State.realized_pnl += slice_pnl
-                
-                pos['qty'] += -current_slice if pos['is_long'] else current_slice
-                
-                if remaining <= 0 or pos['qty'] == 0:
-                    del State.positions[scrip_code]
-                    State.ui_elements.pop(f'ltp_{scrip_code}', None)
-                    break
-                time.sleep(AlgoConfig.SLICE_DELAY_SEC)
-            except Exception as e:
-                logging.error(f"Slice failed: {e}")
-                pos['is_closing'] = False
-                break
-    threading.Thread(target=slicer_thread, daemon=True).start()
-
-def process_tick(scrip_code, ltp):
-    if AlgoConfig.HALT_TRADING: return
-    if State.realized_pnl <= AlgoConfig.MAX_DAILY_LOSS: AlgoConfig.HALT_TRADING = True; return
-    
-    pos = State.positions.get(scrip_code)
-    if not pos or pos.get('is_closing', False): return 
-    pos['ltp'] = round(ltp, 2)
-    
-    sl_hit = (pos['is_long'] and pos['sl'] > 0 and ltp <= pos['sl']) or (not pos['is_long'] and pos['sl'] > 0 and ltp >= pos['sl'])
-    tp_hit = (pos['is_long'] and pos['tp'] > 0 and ltp >= pos['tp']) or (not pos['is_long'] and pos['tp'] > 0 and ltp <= pos['tp'])
-    
-    if sl_hit: execute_square_off(scrip_code, "SL Hit", ltp)
-    elif tp_hit: execute_square_off(scrip_code, "TP Hit", ltp)
-
-def on_message(msg):
-    try:
-        data = json.loads(msg)
-        for tick in data:
-            scrip = tick.get('Token')
-            ltp = tick.get('LastTradedPrice') or tick.get('LastRate')
-            if scrip and ltp: process_tick(scrip, float(ltp))
-    except Exception: pass 
-
-def ws_worker():
-    if not broker: return
-    try:
-        req_list = [{"Exch": "N", "ExchType": "D", "ScripCode": scrip} for scrip in State.positions.keys()]
-        if not req_list: return
-        broker.start_websocket(req_list, on_message)
-    except Exception as e: logging.error(f"WS Error: {e}")
-
 # ==========================================
-# 5. CHARTING ENGINE & UI DASHBOARD
+# 4. CHARTING & UI DASHBOARD
 # ==========================================
 def generate_payoff_chart(positions_dict, days_to_expiry=3):
     fig = go.Figure()
@@ -295,21 +215,14 @@ def generate_payoff_chart(positions_dict, days_to_expiry=3):
     return fig
 
 def build_ui():
-    with ui.header().classes('bg-slate-900 items-center p-4 justify-between'):
+    with ui.header().classes('bg-slate-900 items-center p-4 justify-between flex-nowrap'):
         title = f'📈 Pro Terminal [{State.active_broker_name}]'
         ui.label(title).classes('text-2xl font-bold text-orange-400' if State.is_mock_mode else 'text-2xl font-bold text-white')
         
-        with ui.row().classes('gap-4 items-center'):
+        with ui.row().classes('gap-4 items-center flex-nowrap'):
             ui.label().bind_text_from(State, 'realized_pnl', backward=lambda p: f"Booked: ₹{p:.2f}").classes('text-gray-300 font-bold')
             State.ui_elements['total_running_pnl'] = ui.label("Running: ₹0.00").classes('text-yellow-400 font-bold')
-            
-            def hard_logout():
-                if os.path.exists(auth.SESSION_FILE): os.remove(auth.SESSION_FILE)
-                State.is_mock_mode = False
-                State.positions.clear()
-                ui.navigate.to('/login')
-                
-            ui.button(icon='logout', color='red', on_click=hard_logout).classes('ml-4 p-2')
+            ui.button(icon='logout', color='red', on_click=lambda: [os.remove(auth.SESSION_FILE) if os.path.exists(auth.SESSION_FILE) else None, setattr(State, 'is_mock_mode', False), State.positions.clear(), ui.navigate.to('/login')]).classes('ml-4 p-2')
 
     if not State.positions and not State.is_mock_mode:
         fetch_live_positions()
@@ -318,42 +231,34 @@ def build_ui():
         live_tab = ui.tab('Live Execution')
         builder_tab = ui.tab('Strategy Builder')
 
-    with ui.tab_panels(tabs, value=live_tab).classes('w-full max-w-7xl mx-auto'):
+    with ui.tab_panels(tabs, value=builder_tab).classes('w-full max-w-7xl mx-auto'):
+        
+        # --- LIVE TAB ---
         with ui.tab_panel(live_tab):
-            State.ui_elements['live_chart'] = ui.plotly(generate_payoff_chart(State.positions)).classes('w-full mb-4')
-            
-            with ui.row().classes('w-full bg-slate-200 p-2 font-bold text-center text-sm flex'):
-                ui.label("Symbol").classes('w-2/12 text-left'); ui.label("Qty").classes('w-1/12')
-                ui.label("LTP/PnL").classes('w-2/12'); ui.label("Scale").classes('w-2/12')
-                ui.label("SL").classes('w-1/12'); ui.label("TP").classes('w-1/12')
-                ui.label("Slice").classes('w-1/12'); ui.label("Action").classes('w-2/12')
+            State.ui_elements['live_chart'] = ui.plotly(generate_payoff_chart(State.positions)).classes('w-full mb-4 h-[300px]')
+            with ui.row().classes('w-full bg-slate-200 p-2 font-bold text-center text-sm flex-nowrap'):
+                ui.label("Symbol").classes('w-3/12 text-left'); ui.label("Qty").classes('w-1/12'); ui.label("LTP/PnL").classes('w-2/12')
+                ui.label("Scale").classes('w-3/12'); ui.label("Action").classes('w-3/12')
 
             for scrip, data in State.positions.items():
-                with ui.row().classes('w-full bg-white shadow p-2 items-center text-center text-sm flex'):
-                    ui.label(data['symbol']).classes('w-2/12 font-bold text-left')
+                with ui.row().classes('w-full bg-white shadow p-2 items-center text-center text-sm flex-nowrap'):
+                    ui.label(data['symbol']).classes('w-3/12 font-bold text-left truncate')
                     State.ui_elements[f'qty_{scrip}'] = ui.label(str(data['qty'])).classes('w-1/12 font-bold text-lg')
-                    
                     with ui.column().classes('w-2/12 gap-0'):
                         State.ui_elements[f'ltp_{scrip}'] = ui.label(f"₹{data['ltp']}").classes('font-bold')
                         State.ui_elements[f'pnl_{scrip}'] = ui.label("₹0.00").classes('font-bold text-xs')
-                    
-                    with ui.row().classes('w-2/12 justify-center gap-1'):
-                        ui.number(value=data['adjust_lot'], format='%d', on_change=lambda e, s=scrip: State.positions[s].update({'adjust_lot': int(e.value)})).classes('w-10').props('dense')
-                        ui.button("+", color='green', on_click=lambda s=scrip: adjust_position(s, State.positions[s]['adjust_lot'], True)).classes('p-1 h-6 min-w-0')
-                        ui.button("-", color='orange', on_click=lambda s=scrip: adjust_position(s, State.positions[s]['adjust_lot'], False)).classes('p-1 h-6 min-w-0')
-                    
-                    ui.number(value=data['sl'], format='%.2f', on_change=lambda e, s=scrip: State.positions[s].update({'sl': e.value})).classes('w-1/12').props('dense')
-                    ui.number(value=data['tp'], format='%.2f', on_change=lambda e, s=scrip: State.positions[s].update({'tp': e.value})).classes('w-1/12').props('dense')
-                    ui.number(value=data['slice_size'], format='%d', on_change=lambda e, s=scrip: State.positions[s].update({'slice_size': int(e.value)})).classes('w-1/12').props('dense')
-                    ui.button("Square Off", color='red', on_click=lambda s=scrip: execute_square_off(s, "Manual", State.positions[s]['ltp'])).classes('w-2/12 h-8 text-xs font-bold')
+                    with ui.row().classes('w-3/12 justify-center gap-1 flex-nowrap'):
+                        ui.number(value=data['adjust_lot'], format='%d').classes('w-12').props('dense')
+                        ui.button("+", color='green').classes('p-1 h-6 min-w-0')
+                        ui.button("-", color='orange').classes('p-1 h-6 min-w-0')
+                    ui.button("Square Off", color='red').classes('w-3/12 h-8 text-xs font-bold')
 
         # --- OPTION CHAIN & STRATEGY BUILDER ---
         with ui.tab_panel(builder_tab):
-            def add_to_sim(strike, opt_type, price, is_buy):
-                code = f"SIM_{strike}_{opt_type}"
+            def add_to_sim(strike, opt_type, price, is_buy, instrument_code):
                 qty = 50 if is_buy else -50
-                if code in State.simulated_cart: State.simulated_cart[code]['qty'] += qty
-                else: State.simulated_cart[code] = {'symbol': f"NIFTY {strike} {opt_type}", 'strike': strike, 'opt_type': opt_type, 'entry': price, 'ltp': price, 'qty': qty}
+                if instrument_code in State.simulated_cart: State.simulated_cart[instrument_code]['qty'] += qty
+                else: State.simulated_cart[instrument_code] = {'symbol': instrument_code, 'strike': strike, 'opt_type': opt_type, 'entry': price, 'ltp': price, 'qty': qty}
                 State.ui_elements['sim_chart'].update_figure(generate_payoff_chart(State.simulated_cart))
                 render_cart()
                 
@@ -370,51 +275,64 @@ def build_ui():
 
             with ui.row().classes('w-full gap-4 flex-nowrap'):
                 
-                # LEFT COLUMN: The Option Chain (Given 60% of the screen)
-                with ui.column().classes('w-[60%] min-w-[600px]'):
+                # LEFT COLUMN: 60% Width
+                with ui.column().classes('w-[60%] min-w-[550px]'):
                     ui.label("Live Option Chain (NIFTY)").classes('font-bold text-lg bg-gray-200 p-2 w-full rounded')
                     
                     with ui.row().classes('w-full font-bold text-[11px] bg-slate-100 p-2 text-center flex-nowrap items-center'):
-                        ui.label("CE Buy").classes('flex-1')
-                        ui.label("CE Sell").classes('flex-1')
-                        ui.label("LTP").classes('flex-1')
-                        ui.label("OI Chg").classes('flex-1')
+                        ui.label("CE Buy").classes('flex-1'); ui.label("CE Sell").classes('flex-1')
+                        ui.label("LTP").classes('flex-1'); ui.label("OI").classes('flex-1')
                         ui.label("STRIKE").classes('flex-1 text-blue-600 text-sm')
-                        ui.label("OI Chg").classes('flex-1')
-                        ui.label("LTP").classes('flex-1')
-                        ui.label("PE Sell").classes('flex-1')
-                        ui.label("PE Buy").classes('flex-1')
+                        ui.label("OI").classes('flex-1'); ui.label("LTP").classes('flex-1')
+                        ui.label("PE Sell").classes('flex-1'); ui.label("PE Buy").classes('flex-1')
 
-                    mock_chain_data = {
-                        21800: {'ce_ltp': 245.5, 'ce_oi': '+12.5k', 'pe_ltp': 12.2,  'pe_oi': '-2.1k'},
-                        21900: {'ce_ltp': 175.0, 'ce_oi': '+18.2k', 'pe_ltp': 34.5,  'pe_oi': '+1.5k'},
-                        22000: {'ce_ltp': 115.0, 'ce_oi': '+25.0k', 'pe_ltp': 95.0,  'pe_oi': '+5.8k'},
-                        22100: {'ce_ltp': 68.5,  'ce_oi': '+10.1k', 'pe_ltp': 148.0, 'pe_oi': '+18.9k'},
-                        22200: {'ce_ltp': 35.0,  'ce_oi': '+4.5k',  'pe_ltp': 215.5, 'pe_oi': '+22.4k'},
-                    }
+                    # 1. Ask broker for chain. 2. If none, generate mock data
+                    raw_chain = broker.get_option_chain() if hasattr(broker, 'get_option_chain') and not State.is_mock_mode else []
+                    mock_chain_data = {}
+                    
+                    if raw_chain:
+                        # Convert Upstox chain into UI mapping
+                        raw_chain = sorted(raw_chain, key=lambda x: x.get('strike_price', 0))
+                        center_idx = len(raw_chain)//2 # Center on spot roughly
+                        for item in raw_chain[max(0, center_idx-3) : center_idx+3]:
+                            strike = item.get('strike_price')
+                            ce = item.get('call_options', {}).get('market_data', {})
+                            pe = item.get('put_options', {}).get('market_data', {})
+                            mock_chain_data[strike] = {
+                                'ce_ltp': ce.get('ltp', 0.0), 'ce_oi': str(ce.get('oi', 0)),
+                                'pe_ltp': pe.get('ltp', 0.0), 'pe_oi': str(pe.get('oi', 0)),
+                                'ce_code': item.get('call_options', {}).get('instrument_key', f'CE_{strike}'),
+                                'pe_code': item.get('put_options', {}).get('instrument_key', f'PE_{strike}')
+                            }
+                    else:
+                        mock_chain_data = {
+                            21800: {'ce_ltp': 245.5, 'ce_oi': '12.5k', 'pe_ltp': 12.2,  'pe_oi': '2.1k', 'ce_code': 'SIM_21800_CE', 'pe_code': 'SIM_21800_PE'},
+                            21900: {'ce_ltp': 175.0, 'ce_oi': '18.2k', 'pe_ltp': 34.5,  'pe_oi': '1.5k', 'ce_code': 'SIM_21900_CE', 'pe_code': 'SIM_21900_PE'},
+                            22000: {'ce_ltp': 115.0, 'ce_oi': '25.0k', 'pe_ltp': 95.0,  'pe_oi': '5.8k', 'ce_code': 'SIM_22000_CE', 'pe_code': 'SIM_22000_PE'},
+                            22100: {'ce_ltp': 68.5,  'ce_oi': '10.1k', 'pe_ltp': 148.0, 'pe_oi': '18.9k', 'ce_code': 'SIM_22100_CE', 'pe_code': 'SIM_22100_PE'},
+                            22200: {'ce_ltp': 35.0,  'ce_oi': '4.5k',  'pe_ltp': 215.5, 'pe_oi': '22.4k', 'ce_code': 'SIM_22200_CE', 'pe_code': 'SIM_22200_PE'},
+                        }
 
                     for strike, data in mock_chain_data.items():
                         with ui.row().classes('w-full border-b p-1 items-center text-center flex-nowrap'):
-                            ui.button("B", color='green', on_click=lambda s=strike, p=data['ce_ltp']: add_to_sim(s, 'CE', p, True)).classes('flex-1 h-8 min-w-0 p-0 text-xs')
-                            ui.button("S", color='red', on_click=lambda s=strike, p=data['ce_ltp']: add_to_sim(s, 'CE', p, False)).classes('flex-1 h-8 min-w-0 p-0 text-xs')
+                            ui.button("B", color='green', on_click=lambda s=strike, p=data['ce_ltp'], c=data['ce_code']: add_to_sim(s, 'CE', p, True, c)).classes('flex-1 h-8 min-w-0 p-0 text-xs')
+                            ui.button("S", color='red', on_click=lambda s=strike, p=data['ce_ltp'], c=data['ce_code']: add_to_sim(s, 'CE', p, False, c)).classes('flex-1 h-8 min-w-0 p-0 text-xs')
                             ui.label(str(data['ce_ltp'])).classes('flex-1 text-xs font-semibold')
-                            ui.label(data['ce_oi']).classes('flex-1 text-xs ' + ('text-green-600' if '+' in data['ce_oi'] else 'text-red-600'))
+                            ui.label(data['ce_oi']).classes('flex-1 text-[10px] text-gray-500')
                             
                             ui.label(str(strike)).classes('flex-1 font-bold text-sm bg-gray-50 py-1 rounded')
                             
-                            ui.label(data['pe_oi']).classes('flex-1 text-xs ' + ('text-green-600' if '+' in data['pe_oi'] else 'text-red-600'))
+                            ui.label(data['pe_oi']).classes('flex-1 text-[10px] text-gray-500')
                             ui.label(str(data['pe_ltp'])).classes('flex-1 text-xs font-semibold')
-                            ui.button("S", color='red', on_click=lambda s=strike, p=data['pe_ltp']: add_to_sim(s, 'PE', p, False)).classes('flex-1 h-8 min-w-0 p-0 text-xs')
-                            ui.button("B", color='green', on_click=lambda s=strike, p=data['pe_ltp']: add_to_sim(s, 'PE', p, True)).classes('flex-1 h-8 min-w-0 p-0 text-xs')
+                            ui.button("S", color='red', on_click=lambda s=strike, p=data['pe_ltp'], c=data['pe_code']: add_to_sim(s, 'PE', p, False, c)).classes('flex-1 h-8 min-w-0 p-0 text-xs')
+                            ui.button("B", color='green', on_click=lambda s=strike, p=data['pe_ltp'], c=data['pe_code']: add_to_sim(s, 'PE', p, True, c)).classes('flex-1 h-8 min-w-0 p-0 text-xs')
                 
-                # RIGHT COLUMN: Cart & Execution (Given 38% of the screen)
+                # RIGHT COLUMN: 38% Width
                 with ui.column().classes('w-[38%] min-w-[350px] bg-white shadow-lg p-4 rounded border'):
                     ui.label("Strategy Cart & Payoff").classes('font-bold text-lg mb-2')
-                    
                     State.ui_elements['sim_chart'] = ui.plotly(generate_payoff_chart({})).classes('w-full h-[280px]')
                     
                     ui.label("Adjust Legs").classes('font-bold text-sm mt-4 text-gray-500')
-                    
                     with ui.scroll_area().classes('w-full max-h-[200px] border rounded p-2'):
                         State.ui_elements['sim_cart_container'] = ui.column().classes('w-full gap-2')
                     
@@ -433,11 +351,11 @@ def build_ui():
                             ui.notify("Cart is empty!", type="warning")
                             return
                         if State.is_mock_mode:
-                            ui.notify("Mock Order Placed Successfully!", type="positive")
+                            ui.notify("Mock Strategy Placed Successfully!", type="positive")
                         else:
                             ui.notify(f"Executing Strategy to {State.active_broker_name}...", type="info")
                             for code, leg in State.simulated_cart.items():
-                                broker.place_order(leg['symbol'], abs(leg['qty']), leg['qty'] > 0)
+                                broker.place_order(code, abs(leg['qty']), leg['qty'] > 0)
                         
                         State.simulated_cart.clear()
                         State.ui_elements['sim_chart'].update_figure(generate_payoff_chart({}))
@@ -451,7 +369,8 @@ def update_ui_loop():
     total_running_pnl = 0.0; current_qty_sum = 0
     for scrip, data in list(State.positions.items()):
         current_qty_sum += data['qty']
-        ltp_lbl, pnl_lbl, qty_lbl = State.ui_elements.get(f'ltp_{scrip}'), State.ui_elements.get(f'pnl_{scrip}'), State.ui_elements.get(f'qty_{scrip}')
+        ltp_lbl, pnl_lbl = State.ui_elements.get(f'ltp_{scrip}'), State.ui_elements.get(f'pnl_{scrip}')
+        qty_lbl = State.ui_elements.get(f'qty_{scrip}')
         
         if ltp_lbl and pnl_lbl and qty_lbl:
             ltp_lbl.set_text(f"₹{data['ltp']}")
@@ -469,7 +388,7 @@ def update_ui_loop():
         State.ui_elements['total_running_pnl'].set_text(f"Running: ₹{total_running_pnl:.2f}")
 
 # ==========================================
-# 6. MAIN ROUTING & EXECUTION
+# 5. MAIN ROUTING & EXECUTION
 # ==========================================
 @ui.page('/')
 def main_page():
@@ -478,48 +397,28 @@ def main_page():
     
     if not is_mock:
         active_broker = session.get('ACTIVE_BROKER')
-        
-        if active_broker == '5paisa' and (not session.get('ACCESS_TOKEN') or auth.is_token_expired(session)):
-            ui.navigate.to('/login')
-            return
-        elif not active_broker:
+        if not active_broker or (active_broker in ['5paisa', 'UPSTOX'] and (not session.get('ACCESS_TOKEN') or auth.is_token_expired(session))):
             ui.navigate.to('/login')
             return
 
         is_connected = initialize_client(session)
-        
         if not is_connected:
             with ui.card().classes('absolute-center w-full max-w-md p-8 shadow-2xl rounded-xl border border-red-200 text-center'):
                 ui.label(f"🚨 {active_broker} Connection Failed!").classes('text-2xl font-bold text-red-600 mb-2')
-                ui.label("The background API connection test failed. Check your credentials.").classes('text-gray-700')
-                
-                def reset_and_retry():
-                    session.clear() 
-                    auth.save_session(session)
-                    ui.navigate.to('/login')
-                    
-                def activate_mock():
-                    session['MOCK_MODE'] = True
-                    auth.save_session(session)
-                    ui.navigate.to('/')
-                    
-                ui.button("Proceed with Sample Data", color="orange", on_click=activate_mock).classes('mt-6 w-full font-bold')
-                ui.button("Clear Data & Try Again", color="red", on_click=reset_and_retry).classes('mt-2 w-full font-bold')
+                ui.label("The background API test failed. Check your API Keys.").classes('text-gray-700')
+                ui.button("Proceed with Sample Data", color="orange", on_click=lambda: [session.update({'MOCK_MODE': True}), auth.save_session(session), ui.navigate.to('/')]).classes('mt-6 w-full font-bold')
+                ui.button("Clear Data & Try Again", color="red", on_click=lambda: [session.clear(), auth.save_session(session), ui.navigate.to('/login')]).classes('mt-2 w-full font-bold')
             return
             
     else:
         State.is_mock_mode = True
-        if not State.positions:
-            setup_mock_iron_condor()
+        if not State.positions: setup_mock_iron_condor()
     
     build_ui()
     
     if is_mock:
         if not any(thread.name == "mock_ws_thread" for thread in threading.enumerate()):
             threading.Thread(target=mock_ws_worker, name="mock_ws_thread", daemon=True).start()
-    else:
-        if not any(thread.name == f"{session.get('ACTIVE_BROKER')}_ws_thread" for thread in threading.enumerate()):
-            threading.Thread(target=ws_worker, name=f"{session.get('ACTIVE_BROKER')}_ws_thread", daemon=True).start()
     
     ui.timer(0.5, update_ui_loop)
 
